@@ -1,0 +1,66 @@
+
+
+import os
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+
+# -------------------- SETUP PATHS --------------------
+
+# Absolute paths to image folders
+yes_path = r"C:\Users\kotes\PycharmProjects\BrainTumorProject\data\Kaggle_Brain_MRI\yes"
+no_path = r"C:\Users\kotes\PycharmProjects\BrainTumorProject\data\Kaggle_Brain_MRI\no"
+
+# -------------------- LOAD AND LABEL DATA --------------------
+
+data = []
+labels = []
+
+image_size = (128, 128)  # Resize all images to 128x128
+
+def load_images_from_folder(folder_path, label):
+    for filename in os.listdir(folder_path):
+        if filename.endswith((".jpg", ".jpeg", ".png")):
+            img_path = os.path.join(folder_path, filename)
+            try:
+                img = Image.open(img_path).convert('L')  # Convert to grayscale
+                img = img.resize(image_size)
+                img_array = np.array(img)
+                data.append(img_array)
+                labels.append(label)
+            except Exception as e:
+                print(f"Error loading image {img_path}: {e}")
+
+load_images_from_folder(yes_path, 1)  # Tumor = 1
+load_images_from_folder(no_path, 0)   # No Tumor = 0
+
+# -------------------- CONVERT TO NUMPY AND RESHAPE --------------------
+
+data = np.array(data)
+labels = np.array(labels)
+
+# Normalize pixel values
+data = data / 255.0
+
+# Add channel dimension for CNNs (grayscale = 1 channel)
+data = data.reshape(-1, 128, 128, 1)
+
+# -------------------- SPLIT INTO TRAIN & TEST --------------------
+
+x_train, x_test, y_train, y_test = train_test_split(data, labels, test_size=0.2, random_state=42)
+
+# -------------------- DISPLAY SAMPLE --------------------
+
+def show_sample(img, label):
+    plt.imshow(img.reshape(128, 128), cmap='gray')
+    plt.title("Tumor" if label == 1 else "No Tumor")
+    plt.axis("off")
+    plt.show()
+
+print("Dataset loaded!")
+print("Total images:", len(data))
+print("Training set:", len(x_train), "Testing set:", len(x_test))
+
+# Show one image from the training set
+show_sample(x_train[0], y_train[0])
