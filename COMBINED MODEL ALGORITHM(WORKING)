@@ -1,0 +1,206 @@
+import numpy as np
+import pandas as pd
+import os
+import cv2
+from PIL import Image
+import matplotlib.pyplot as plt
+import seaborn as sns
+from skimage.feature import graycomatrix, graycoprops
+from scipy.stats import skew, kurtosis
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.models import Model
+from tensorflow.keras.applications.vgg16 import preprocess_input
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, classification_report
+from sklearn.preprocessing import LabelEncoder
+from sklearn.utils.class_weight import compute_class_weight
+
+# --- 1. Data Loading and Preprocessing for 4-class dataset ---
+def load_multi_class_data(base_dir): 
+    images = []
+    labels = []
+    
+    # Automatically detect category folders
+    categories = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+    supported_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
+    image_size = (128, 128)
+    
+    print(f"Loading data from: {base_dir}")
+    for category in categories:
+        folder_path = os.path.join(base_dir, category)
+        
+        for filename in os.listdir(folder_path):
+            if filename.lower().endswith(supported_extensions):
+                filepath = os.path.join(folder_path, filename)
+                try:
+                    img_pil = Image.open(filepath).convert('L')
+                    img = np.array(img_pil.resize(image_size))
+                    images.append(img)
+                    labels.append(category)  # Use folder name as label
+                except Exception as e:
+                    print(f"Error loading image {filepath}: {e}")
+    
+    if not images:
+        return np.array([]), np.array([])
+        
+    images_np = np.array(images)
+    labels_np = np.array(labels)
+    
+    print(f"Successfully loaded {len(images)} images across {len(categories)} classes: {categories}")
+    return images_np, labels_np
+
+
+
+
+# --- 2. Feature Extraction ---
+
+def extract_handcrafted_features(image_array):
+    features = {}
+    image_uint8 = cv2.normalize(image_array, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+    features['mean_intensity'] = np.mean(image_array)
+    features['std_intensity'] = np.std(image_array)
+    features['skewness_intensity'] = skew(image_array.flatten())
+    features['kurtosis_intensity'] = kurtosis(image_array.flatten())
+    try:
+        image_uint8 = np.ascontiguousarray(image_uint8)
+        glcm = graycomatrix(image_uint8, distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
+        features['glcm_contrast'] = graycoprops(glcm, 'contrast')[0, 0]
+        features['glcm_energy'] = graycoprops(glcm, 'energy')[0, 0]
+        features['glcm_homogeneity'] = graycoprops(glcm, 'homogeneity')[0, 0]
+    except ValueError:
+        features.update({'glcm_contrast': np.nan, 'glcm_energy': np.nan, 'glcm_homogeneity': np.nan})
+    return pd.Series(features)
+
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.models import Model
+
+# Step 1: Initialize VGG16 without weights (avoid 'imagenet')
+vgg_base_model = VGG16(
+    weights=None,
+    include_top=False,
+    input_shape=(128, 128, 3)
+)
+
+# Step 2: Load your uploaded weights
+vgg_base_model.load_weights(
+    "/kaggle/input/vgg16-dataset/vgg16_weights_tf_dim_ordering_tf_kernels_notop.h5"
+)
+
+# Step 3: Create the deep feature extractor model
+deep_feature_extractor_model = Model(
+    inputs=vgg_base_model.input,
+    outputs=vgg_base_model.get_layer("block5_pool").output
+)
+
+def extract_deep_features(image_array):
+    # Ensure image is 2D (remove channel dimension if present)
+    if image_array.ndim == 3 and image_array.shape[-1] == 1:
+        image_array = np.squeeze(image_array, axis=-1)
+    
+    # Convert grayscale → RGB (128,128,3)
+    image_rgb = np.stack([image_array] * 3, axis=-1)
+    
+    # Add batch dimension
+    image_for_vgg = np.expand_dims(image_rgb, axis=0)
+    
+    preprocessed_image = preprocess_input(image_for_vgg)
+    deep_features = deep_feature_extractor_model.predict(preprocessed_image, verbose=0)
+    return pd.Series(deep_features.flatten())
+
+def fuse_features(handcrafted_features, deep_features):
+    if handcrafted_features is None or deep_features is None:
+        raise ValueError("Cannot fuse features: one of the input feature sets is None.")
+    fused_features = pd.concat([handcrafted_features, deep_features])
+    return fused_features
+
+# --- 3. Model Training and Evaluation ---
+
+def train_and_evaluate_models(X_train, y_train, X_test, y_test):
+    print("\n--- Starting Model Training and Evaluation ---")
+    
+    # Pre-process features for models
+    X_train_df = pd.DataFrame(X_train).astype(float).fillna(0)
+    X_test_df = pd.DataFrame(X_test).astype(float).fillna(0)
+
+    # Use LabelEncoder to convert string labels to integers
+    label_encoder = LabelEncoder()
+    y_train_encoded = label_encoder.fit_transform(y_train)
+    y_test_encoded = label_encoder.transform(y_test)
+    
+    # Compute class weights for imbalanced data
+    class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train_encoded), y=y_train_encoded)
+    class_weight_dict = {i: weight for i, weight in enumerate(class_weights)}
+
+    rf_clf = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
+    print("\nTraining Random Forest Classifier...")
+    rf_clf.fit(X_train_df, y_train_encoded)
+    rf_pred = rf_clf.predict(X_test_df)
+
+    svm_clf = SVC(C=1.0, kernel='rbf', probability=True, random_state=42, class_weight=class_weight_dict)
+    print("Training SVM Classifier (can take some time)...")
+    svm_clf.fit(X_train_df, y_train_encoded)
+    svm_pred = svm_clf.predict(X_test_df)
+
+    lr_clf = LogisticRegression(random_state=42, solver='liblinear', class_weight=class_weight_dict, max_iter=1000, multi_class='ovr')
+    print("Training Logistic Regression Classifier...")
+    lr_clf.fit(X_train_df, y_train_encoded)
+    lr_pred = lr_clf.predict(X_test_df)
+    
+    print("\nAll models trained successfully.")
+    
+    # --- Multi-class Evaluation ---
+    print("\n--- Multi-class Evaluation Metrics ---")
+    
+    def evaluate_multi_class_model(y_true, y_pred, model_name, target_names):
+        print(f"\n--- Evaluation for {model_name} ---")
+        print(classification_report(y_true, y_pred, target_names=target_names))
+        cm = confusion_matrix(y_true, y_pred)
+        print(f"Confusion Matrix:\n{cm}")
+        
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=target_names, yticklabels=target_names)
+        plt.title(f'Confusion Matrix for {model_name}')
+        plt.ylabel('Actual Label')
+        plt.xlabel('Predicted Label')
+        plt.show()
+
+    target_names = label_encoder.classes_
+    evaluate_multi_class_model(y_test_encoded, rf_pred, "Random Forest Classifier", target_names)
+    evaluate_multi_class_model(y_test_encoded, svm_pred, "SVM Classifier", target_names)
+    evaluate_multi_class_model(y_test_encoded, lr_pred, "Logistic Regression Classifier", target_names)
+    
+    print("\nModel training and evaluation complete.")
+    print("You can now analyze the multi-class performance in your paper.")
+    
+if __name__ == "__main__":
+    print("Loading data and extracting features for model training...")
+    
+    train_dir = "/kaggle/input/brain-tumor-classification-mri/Training"
+    test_dir  = "/kaggle/input/brain-tumor-classification-mri/Testing"
+
+    # Load data separately for training and testing
+    X_train_raw, y_train_raw = load_multi_class_data(train_dir)
+    X_test_raw, y_test_raw = load_multi_class_data(test_dir)
+    
+    if X_train_raw.size == 0 or X_test_raw.size == 0:
+        print("No images loaded. Cannot proceed with model training.")
+    else:
+        # Pre-process raw image data
+        X_train_reshaped = X_train_raw.reshape(-1, 128, 128, 1)
+        X_test_reshaped = X_test_raw.reshape(-1, 128, 128, 1)
+
+        # Extract and fuse features for both training and testing sets
+        print("\nExtracting and fusing features for training set...")
+        all_train_fused_features = [fuse_features(extract_handcrafted_features(img.squeeze()), extract_deep_features(img)) for img in X_train_reshaped]
+        X_train_fused = pd.DataFrame(all_train_fused_features)
+        X_train_fused.columns = X_train_fused.columns.astype(str)
+
+        print("Extracting and fusing features for testing set...")
+        all_test_fused_features = [fuse_features(extract_handcrafted_features(img.squeeze()), extract_deep_features(img)) for img in X_test_reshaped]
+        X_test_fused = pd.DataFrame(all_test_fused_features)
+        X_test_fused.columns = X_test_fused.columns.astype(str)
+        
+        print("\nFeatures extracted and fused. Proceeding to model training...")
+        train_and_evaluate_models(X_train_fused, y_train_raw, X_test_fused, y_test_raw)
