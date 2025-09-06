@@ -1,0 +1,213 @@
+import numpy as np
+import pandas as pd
+import os
+import cv2
+from PIL import Image
+import matplotlib.pyplot as plt
+from skimage.feature import graycomatrix, graycoprops
+from scipy.stats import skew, kurtosis
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.models import Model
+from tensorflow.keras.applications.vgg16 import preprocess_input
+
+def load_kaggle_brain_mri_data(data_dir):
+    images = []
+    labels = []
+    image_paths = []
+
+    yes_dir = os.path.join(data_dir, 'yes')
+    no_dir = os.path.join(data_dir, 'no')
+
+    supported_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
+
+    if os.path.exists(yes_dir):
+        print(f"Loading images from: {yes_dir}")
+        for filename in os.listdir(yes_dir):
+            if filename.lower().endswith(supported_extensions):
+                filepath = os.path.join(yes_dir, filename)
+                img = None
+                try:
+                    img_pil = Image.open(filepath).convert('L')
+                    img = np.array(img_pil)
+                except Exception as e:
+                    print(f"Error loading image {filepath} with Pillow: {e}")
+
+                if img is not None:
+                    img = cv2.resize(img, (128, 128))
+                    images.append(img)
+                    labels.append(1)
+                    image_paths.append(filepath)
+                else:
+                    print(f"Warning: Skipping {filepath} due to loading error.")
+    else:
+        print(f"Directory not found: {yes_dir}")
+        print("Please ensure the 'yes' folder exists directly inside your 'Kaggle_Brain_MRI' directory.")
+
+
+    if os.path.exists(no_dir):
+        print(f"Loading images from: {no_dir}")
+        for filename in os.listdir(no_dir):
+            if filename.lower().endswith(supported_extensions):
+                filepath = os.path.join(no_dir, filename)
+                img = None
+                try:
+                    img_pil = Image.open(filepath).convert('L')
+                    img = np.array(img_pil)
+                except Exception as e:
+                    print(f"Error loading image {filepath} with Pillow: {e}")
+
+                if img is not None:
+                    img = cv2.resize(img, (128, 128))
+                    images.append(img)
+                    labels.append(0)
+                    image_paths.append(filepath)
+                else:
+                    print(f"Warning: Skipping {filepath} due to loading error.")
+    else:
+        print(f"Directory not found: {no_dir}")
+        print("Please ensure the 'no' folder exists directly inside your 'Kaggle_Brain_MRI' directory.")
+
+
+    if not images:
+        print("No images were loaded. Returning empty arrays.")
+        return np.array([]), np.array([]), []
+
+    images_np = np.array(images)
+    labels_np = np.array(labels)
+
+    images_flattened = images_np.reshape(images_np.shape[0], -1)
+
+    print(f"\nSuccessfully loaded {len(images)} images.")
+    print(f"Image data shape (flattened): {images_flattened.shape}")
+    print(f"Labels shape: {labels_np.shape}")
+    print(f"Number of 'yes' (tumor) samples: {np.sum(labels_np == 1)}")
+    print(f"Number of 'no' (no tumor) samples: {np.sum(labels_np == 0)}")
+
+    return images_flattened, labels_np, image_paths
+
+def visualize_sample_images(images_flattened, labels, image_paths, num_samples=5):
+    if len(images_flattened) == 0:
+        print("No images to visualize.")
+        return
+
+    sample_height = 128
+    sample_width = 128
+
+    plt.figure(figsize=(12, 6))
+    for i in range(min(num_samples, len(images_flattened))):
+        plt.subplot(1, num_samples, i + 1)
+        img_to_show = images_flattened[i].reshape(sample_height, sample_width)
+        plt.imshow(img_to_show, cmap='gray', vmin=0, vmax=255)
+        plt.title(f"Label: {'Tumor' if labels[i] == 1 else 'No Tumor'}")
+        plt.axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+def extract_handcrafted_features(image_array):
+    features = {}
+
+    if image_array.ndim == 3 and image_array.shape[-1] == 1:
+        image_array = image_array.squeeze()
+    elif image_array.ndim != 2:
+        raise ValueError("Image array must be 2D for handcrafted feature extraction.")
+
+    image_uint8 = cv2.normalize(image_array, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+
+    features['mean_intensity'] = np.mean(image_array)
+    features['std_intensity'] = np.std(image_array)
+    features['min_intensity'] = np.min(image_array)
+    features['max_intensity'] = np.max(image_array)
+    features['skewness_intensity'] = skew(image_array.flatten())
+    features['kurtosis_intensity'] = kurtosis(image_array.flatten())
+    features['median_intensity'] = np.median(image_array)
+    features['variance_intensity'] = np.var(image_array)
+
+    image_uint8 = np.ascontiguousarray(image_uint8)
+
+    try:
+        glcm = graycomatrix(image_uint8, distances=[1, 2], angles=[0, np.pi/4, np.pi/2, 3*np.pi/4], levels=256, symmetric=True, normed=True)
+
+        features['glcm_contrast'] = graycoprops(glcm, 'contrast').mean()
+        features['glcm_dissimilarity'] = graycoprops(glcm, 'dissimilarity').mean()
+        features['glcm_homogeneity'] = graycoprops(glcm, 'homogeneity').mean()
+        features['glcm_energy'] = graycoprops(glcm, 'energy').mean()
+        features['glcm_correlation'] = graycoprops(glcm, 'correlation').mean()
+        features['glcm_ASM'] = graycoprops(glcm, 'ASM').mean()
+
+    except ValueError as e:
+        print(f"Warning: Could not calculate GLCM for image. Error: {e}. Skipping GLCM features.")
+        glcm_features_names = ['glcm_contrast', 'glcm_dissimilarity', 'glcm_homogeneity', 'glcm_energy', 'glcm_correlation', 'glcm_ASM']
+        for name in glcm_features_names:
+            features[name] = np.nan
+
+    return pd.Series(features)
+
+vgg_base_model = VGG16(weights='imagenet', include_top=False, input_shape=(128, 128, 3))
+deep_feature_extractor_model = Model(inputs=vgg_base_model.input, outputs=vgg_base_model.get_layer('block5_pool').output)
+
+def extract_deep_features(image_array):
+    if image_array.ndim == 2:
+        image_array = np.expand_dims(image_array, axis=-1)
+
+    image_rgb = np.repeat(image_array, 3, axis=-1)
+
+    image_for_vgg = np.expand_dims(image_rgb, axis=0)
+
+    preprocessed_image = preprocess_input(image_for_vgg)
+
+    deep_features = deep_feature_extractor_model.predict(preprocessed_image)
+
+    return pd.Series(deep_features.flatten())
+
+def fuse_features(handcrafted_features, deep_features):
+    if handcrafted_features is None or deep_features is None:
+        raise ValueError("Cannot fuse features: one of the input feature sets is None.")
+
+    fused_features = pd.concat([handcrafted_features, deep_features])
+    return fused_features
+
+if __name__ == "__main__":
+    print("Starting feature extraction process...")
+
+    kaggle_data_directory = os.path.join('data', 'Kaggle_Brain_MRI')
+    all_images_np, all_labels_np, _ = load_kaggle_brain_mri_data(kaggle_data_directory)
+
+    if len(all_images_np) == 0:
+        print("No images loaded. Cannot proceed with feature extraction.")
+    else:
+        num_samples, flat_dim = all_images_np.shape
+        img_height = img_width = int(np.sqrt(flat_dim))
+
+        all_images_reshaped = all_images_np.reshape(num_samples, img_height, img_width, 1)
+
+        all_handcrafted_features = []
+        all_deep_features = []
+        all_fused_features = []
+
+        for i, image_data in enumerate(all_images_reshaped):
+            print(f"Processing image {i+1}/{num_samples}...")
+            handcrafted_feats = extract_handcrafted_features(image_data.squeeze())
+            all_handcrafted_features.append(handcrafted_feats)
+
+            deep_feats = extract_deep_features(image_data)
+            all_deep_features.append(deep_feats)
+
+            fused_feats = fuse_features(handcrafted_feats, deep_feats)
+            all_fused_features.append(fused_feats)
+
+        final_handcrafted_df = pd.DataFrame(all_handcrafted_features)
+        final_deep_df = pd.DataFrame(all_deep_features)
+        final_fused_df = pd.DataFrame(all_fused_features)
+
+        print("\n--- Feature Extraction Summary ---")
+        print(f"Handcrafted features shape: {final_handcrafted_df.shape}")
+        print(f"Deep features shape: {final_deep_df.shape}")
+        print(f"Fused features shape: {final_fused_df.shape}")
+
+        print("\nFirst 5 rows of Fused Features:")
+        print(final_fused_df.head())
+
+        print("\nFeature extraction and fusion complete. Data is ready for model training.")
+        print("You now have 'final_fused_df' (your X data) and 'all_labels_np' (your y data).")
+
