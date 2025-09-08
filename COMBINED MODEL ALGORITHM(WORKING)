@@ -1,206 +1,271 @@
+import os
 import numpy as np
 import pandas as pd
-import os
 import cv2
-from PIL import Image
+from tqdm import tqdm
+from imblearn.over_sampling import RandomOverSampler
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.pipeline import Pipeline
+from sklearn.utils.class_weight import compute_class_weight
+
+import tensorflow as tf
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras import layers, models
+from tensorflow.keras.applications.vgg16 import preprocess_input
 import matplotlib.pyplot as plt
 import seaborn as sns
 from skimage.feature import graycomatrix, graycoprops
 from scipy.stats import skew, kurtosis
-from tensorflow.keras.applications import VGG16
-from tensorflow.keras.models import Model
-from tensorflow.keras.applications.vgg16 import preprocess_input
-from sklearn.ensemble import RandomForestClassifier, VotingClassifier
-from sklearn.svm import SVC
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, classification_report
-from sklearn.preprocessing import LabelEncoder
-from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout
 
-# --- 1. Data Loading and Preprocessing for 4-class dataset ---
-def load_multi_class_data(base_dir): 
-    images = []
-    labels = []
-    
-    # Automatically detect category folders
+# ------------------------
+# User-tunable params
+# ------------------------
+IMAGE_SIZE = (128, 128)
+BATCH_DEEP = 64                 # batch size for deep-feat extraction
+PCA_COMPONENTS = 300            # for SVM pipeline
+AUGMENT_SIZES = {
+    "glioma_tumor": 4000,
+    "meningioma_tumor": 1000,
+    "no_tumor": 1000,
+    "pituitary_tumor": 1000
+}
+RF_ESTIMATORS = 100
+CNN_EPOCHS = 6
+CNN_LEARNING_RATE = 1e-4
+ENSEMBLE_WEIGHT = 0.5
+CNN_WEIGHT = 0.5
+CNN_BATCH = 32
+LOCAL_VGG_WEIGHTS_PATH = "/kaggle/input/vgg16-dataset/vgg16_weights_tf_dim_ordering_tf_kernels_notop.h5"
+
+# --- 1. Data Loading and Augmentation ---
+def load_multi_class_data(base_dir):
+    images, labels = [], []
     categories = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
-    supported_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
-    image_size = (128, 128)
+    supported_exts = ('.png', '.jpg', '.jpeg')
     
-    print(f"Loading data from: {base_dir}")
-    for category in categories:
-        folder_path = os.path.join(base_dir, category)
-        
-        for filename in os.listdir(folder_path):
-            if filename.lower().endswith(supported_extensions):
-                filepath = os.path.join(folder_path, filename)
-                try:
-                    img_pil = Image.open(filepath).convert('L')
-                    img = np.array(img_pil.resize(image_size))
-                    images.append(img)
-                    labels.append(category)  # Use folder name as label
-                except Exception as e:
-                    print(f"Error loading image {filepath}: {e}")
-    
-    if not images:
-        return np.array([]), np.array([])
-        
-    images_np = np.array(images)
-    labels_np = np.array(labels)
-    
-    print(f"Successfully loaded {len(images)} images across {len(categories)} classes: {categories}")
-    return images_np, labels_np
+    print(f"Loading from {base_dir} -> found categories: {categories}")
+    for cat in categories:
+        folder = os.path.join(base_dir, cat)
+        for fname in os.listdir(folder):
+            if not fname.lower().endswith(supported_exts):
+                continue
+            path = os.path.join(folder, fname)
+            try:
+                im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                im = cv2.resize(im, IMAGE_SIZE)
+                images.append(im)
+                labels.append(cat)
+            except Exception as e:
+                print("Err reading", path, e)
+    images = np.array(images)
+    labels = np.array(labels)
+    print(f"Loaded {len(images)} images.")
+    return images, labels
 
+def augment_class_images(images, labels, augment_sizes):
+    datagen = ImageDataGenerator(
+        rotation_range=20, width_shift_range=0.1, height_shift_range=0.1,
+        zoom_range=0.2, horizontal_flip=True
+    )
+    augmented_images, augmented_labels = [], []
+    images_reshaped = np.expand_dims(images, axis=-1)
 
+    for target_class, num_augment in augment_sizes.items():
+        if num_augment > 0:
+            class_images = images_reshaped[labels == target_class]
+            if len(class_images) == 0: continue
+            
+            gen_iter = datagen.flow(class_images, batch_size=1, seed=42)
+            for _ in range(num_augment):
+                augmented_images.append(next(gen_iter)[0].squeeze())
+                augmented_labels.append(target_class)
 
+    all_images = np.concatenate([images, np.array(augmented_images)])
+    all_labels = np.concatenate([labels, np.array(augmented_labels)])
+    return all_images, all_labels
 
 # --- 2. Feature Extraction ---
-
-def extract_handcrafted_features(image_array):
-    features = {}
-    image_uint8 = cv2.normalize(image_array, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-    features['mean_intensity'] = np.mean(image_array)
-    features['std_intensity'] = np.std(image_array)
-    features['skewness_intensity'] = skew(image_array.flatten())
-    features['kurtosis_intensity'] = kurtosis(image_array.flatten())
+# VGG deep feature extractor
+def build_vgg_extractor():
     try:
-        image_uint8 = np.ascontiguousarray(image_uint8)
-        glcm = graycomatrix(image_uint8, distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
-        features['glcm_contrast'] = graycoprops(glcm, 'contrast')[0, 0]
-        features['glcm_energy'] = graycoprops(glcm, 'energy')[0, 0]
-        features['glcm_homogeneity'] = graycoprops(glcm, 'homogeneity')[0, 0]
-    except ValueError:
-        features.update({'glcm_contrast': np.nan, 'glcm_energy': np.nan, 'glcm_homogeneity': np.nan})
-    return pd.Series(features)
+        vgg = VGG16(weights='imagenet', include_top=False, input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3))
+        print("Loaded VGG16 imagenet weights.")
+    except Exception as e:
+        print("Could not download imagenet weights, trying local path:", e)
+        vgg = VGG16(weights=None, include_top=False, input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3))
+        if os.path.exists(LOCAL_VGG_WEIGHTS_PATH):
+            vgg.load_weights(LOCAL_VGG_WEIGHTS_PATH)
+            print("Loaded local VGG16 weights.")
+        else:
+            print("Local weights not found; using randomly-initialized VGG16 (not ideal).")
+    extractor = tf.keras.Model(inputs=vgg.input, outputs=vgg.get_layer("block5_pool").output)
+    return extractor
 
-from tensorflow.keras.applications import VGG16
-from tensorflow.keras.models import Model
+# Handcrafted features
+def extract_handcrafted_features(images):
+    handcrafted = []
+    for img in tqdm(images):
+        features = {}
+        image_uint8 = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+        features['mean'] = np.mean(img)
+        features['std'] = np.std(img)
+        features['skew'] = skew(img.flatten())
+        features['kurt'] = kurtosis(img.flatten())
+        try:
+            image_uint8 = np.ascontiguousarray(image_uint8)
+            glcm = graycomatrix(image_uint8, distances=[1], angles=[0], levels=256, symmetric=True, normed=True)
+            features['contrast'] = graycoprops(glcm, 'contrast')[0, 0]
+            features['energy'] = graycoprops(glcm, 'energy')[0, 0]
+            features['homogeneity'] = graycoprops(glcm, 'homogeneity')[0, 0]
+        except Exception:
+            features.update({'contrast': 0.0, 'energy': 0.0, 'homogeneity': 0.0})
+        handcrafted.append(list(features.values()))
+    return np.array(handcrafted)
 
-# Step 1: Initialize VGG16 without weights (avoid 'imagenet')
-vgg_base_model = VGG16(
-    weights=None,
-    include_top=False,
-    input_shape=(128, 128, 3)
-)
-
-# Step 2: Load your uploaded weights
-vgg_base_model.load_weights(
-    "/kaggle/input/vgg16-dataset/vgg16_weights_tf_dim_ordering_tf_kernels_notop.h5"
-)
-
-# Step 3: Create the deep feature extractor model
-deep_feature_extractor_model = Model(
-    inputs=vgg_base_model.input,
-    outputs=vgg_base_model.get_layer("block5_pool").output
-)
-
-def extract_deep_features(image_array):
-    # Ensure image is 2D (remove channel dimension if present)
-    if image_array.ndim == 3 and image_array.shape[-1] == 1:
-        image_array = np.squeeze(image_array, axis=-1)
+# Batched feature extraction and fusion
+def extract_and_fuse_features(extractor, X_train, X_test):
+    # Fix: Expand dims to (N, H, W, 1) before repeating to (N, H, W, 3)
+    X_train_rgb = np.repeat(np.expand_dims(X_train, axis=-1), 3, axis=-1)
+    X_test_rgb  = np.repeat(np.expand_dims(X_test, axis=-1), 3, axis=-1)
     
-    # Convert grayscale → RGB (128,128,3)
-    image_rgb = np.stack([image_array] * 3, axis=-1)
+    print("\nExtracting deep features (batched)...")
+    X_train_deep = extractor.predict(preprocess_input(X_train_rgb), batch_size=BATCH_DEEP, verbose=1)
+    X_test_deep  = extractor.predict(preprocess_input(X_test_rgb), batch_size=BATCH_DEEP, verbose=1)
     
-    # Add batch dimension
-    image_for_vgg = np.expand_dims(image_rgb, axis=0)
+    print("\nExtracting handcrafted features...")
+    X_train_hand = extract_handcrafted_features(X_train)
+    X_test_hand  = extract_handcrafted_features(X_test)
+
+    X_train_fused = np.concatenate([X_train_deep.reshape(len(X_train), -1), X_train_hand], axis=1)
+    X_test_fused  = np.concatenate([X_test_deep.reshape(len(X_test), -1), X_test_hand], axis=1)
     
-    preprocessed_image = preprocess_input(image_for_vgg)
-    deep_features = deep_feature_extractor_model.predict(preprocessed_image, verbose=0)
-    return pd.Series(deep_features.flatten())
+    return X_train_fused, X_test_fused
 
-def fuse_features(handcrafted_features, deep_features):
-    if handcrafted_features is None or deep_features is None:
-        raise ValueError("Cannot fuse features: one of the input feature sets is None.")
-    fused_features = pd.concat([handcrafted_features, deep_features])
-    return fused_features
+# --- 3. Fine-tuned CNN branch (transfer learning) ---
+def build_finetuned_cnn(num_classes):
+    base = VGG16(weights='imagenet', include_top=False, input_shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3))
+    for layer in base.layers[:-4]:
+        layer.trainable = False
+    x = GlobalAveragePooling2D()(base.output)
+    x = Dense(512, activation='relu')(x)
+    x = Dropout(0.5)(x)
+    out = Dense(num_classes, activation='softmax')(x)
+    model = tf.keras.Model(inputs=base.input, outputs=out)
+    opt = tf.keras.optimizers.Adam(learning_rate=CNN_LEARNING_RATE)
+    model.compile(optimizer=opt, loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
 
-# --- 3. Model Training and Evaluation ---
-
-def train_and_evaluate_models(X_train, y_train, X_test, y_test):
-    print("\n--- Starting Model Training and Evaluation ---")
+# --- 4. Training and Evaluation ---
+def train_and_evaluate(X_train_fused, y_train, X_test_fused, y_test, X_train_cnn, X_test_cnn):
+    # Label encode
+    le = LabelEncoder()
+    y_train_enc = le.fit_transform(y_train)
+    y_test_enc = le.transform(y_test)
+    classes = le.classes_
+    n_classes = len(classes)
     
-    # Pre-process features for models
-    X_train_df = pd.DataFrame(X_train).astype(float).fillna(0)
-    X_test_df = pd.DataFrame(X_test).astype(float).fillna(0)
+    # Class weights for imbalanced data
+    cw = compute_class_weight(class_weight='balanced', classes=np.unique(y_train_enc), y=y_train_enc)
+    cw_dict = {i: w for i, w in enumerate(cw)}
 
-    # Use LabelEncoder to convert string labels to integers
-    label_encoder = LabelEncoder()
-    y_train_encoded = label_encoder.fit_transform(y_train)
-    y_test_encoded = label_encoder.transform(y_test)
-    
-    # Compute class weights for imbalanced data
-    class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train_encoded), y=y_train_encoded)
-    class_weight_dict = {i: weight for i, weight in enumerate(class_weights)}
+    # Random Forest
+    rf = RandomForestClassifier(n_estimators=RF_ESTIMATORS, random_state=42, class_weight='balanced')
+    rf.fit(X_train_fused, y_train_enc)
+    rf_proba = rf.predict_proba(X_test_fused)
 
-    rf_clf = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
-    print("\nTraining Random Forest Classifier...")
-    rf_clf.fit(X_train_df, y_train_encoded)
-    rf_pred = rf_clf.predict(X_test_df)
+    # SVM pipeline (PCA -> SVC)
+    svm_pipe = Pipeline([
+        ('pca', PCA(n_components=min(PCA_COMPONENTS, X_train_fused.shape[1]), random_state=42)),
+        ('svc', SVC(kernel='rbf', probability=True, class_weight=cw_dict, random_state=42))
+    ])
+    svm_pipe.fit(X_train_fused, y_train_enc)
+    svm_proba = svm_pipe.predict_proba(X_test_fused)
 
-    svm_clf = SVC(C=1.0, kernel='rbf', probability=True, random_state=42, class_weight=class_weight_dict)
-    print("Training SVM Classifier (can take some time)...")
-    svm_clf.fit(X_train_df, y_train_encoded)
-    svm_pred = svm_clf.predict(X_test_df)
+    # Logistic Regression
+    lr = LogisticRegression(max_iter=1200, solver='liblinear', class_weight='balanced', multi_class='ovr')
+    lr.fit(X_train_fused, y_train_enc)
+    lr_proba = lr.predict_proba(X_test_fused)
 
-    lr_clf = LogisticRegression(random_state=42, solver='liblinear', class_weight=class_weight_dict, max_iter=1000, multi_class='ovr')
-    print("Training Logistic Regression Classifier...")
-    lr_clf.fit(X_train_df, y_train_encoded)
-    lr_pred = lr_clf.predict(X_test_df)
+    # Build ensemble
+    print("\nBuilding classical ensemble...")
+    ensemble_proba = (rf_proba + svm_proba + lr_proba) / 3.0
+    ensemble_pred = np.argmax(ensemble_proba, axis=1)
+
+    # --- CNN branch training ---
+    print("\nBuilding & training fine-tuned CNN branch...")
+    cnn = build_finetuned_cnn(num_classes=n_classes)
+    y_train_cat = tf.keras.utils.to_categorical(y_train_enc, num_classes=n_classes)
+    datagen_cnn = ImageDataGenerator(rotation_range=15, width_shift_range=0.1, height_shift_range=0.1,
+                                     shear_range=0.1, zoom_range=0.1, horizontal_flip=True, fill_mode='nearest')
     
-    print("\nAll models trained successfully.")
+    print(f"Training CNN for {CNN_EPOCHS} epochs, batch size {CNN_BATCH}")
+    cnn.fit(datagen_cnn.flow(X_train_cnn, y_train_cat, batch_size=CNN_BATCH, shuffle=True),
+            epochs=CNN_EPOCHS, steps_per_epoch=int(np.ceil(len(X_train_cnn) / CNN_BATCH)),
+            validation_data=(X_test_cnn, tf.keras.utils.to_categorical(y_test_enc, num_classes=n_classes)),
+            verbose=1, class_weight=cw_dict)
     
-    # --- Multi-class Evaluation ---
-    print("\n--- Multi-class Evaluation Metrics ---")
-    
-    def evaluate_multi_class_model(y_true, y_pred, model_name, target_names):
-        print(f"\n--- Evaluation for {model_name} ---")
-        print(classification_report(y_true, y_pred, target_names=target_names))
+    cnn_proba = cnn.predict(X_test_cnn, batch_size=CNN_BATCH, verbose=0)
+    cnn_pred = np.argmax(cnn_proba, axis=1)
+
+    # --- Probability fusion: average of class-probabilities ---
+    print("\nPerforming probability fusion...")
+    final_proba = ENSEMBLE_WEIGHT * ensemble_proba + CNN_WEIGHT * cnn_proba
+    final_pred = np.argmax(final_proba, axis=1)
+
+    # Evaluate and print reports
+    def show_report(y_true, y_pred, name):
+        print(f"\n--- {name} ---")
+        print(classification_report(y_true, y_pred, target_names=le.classes_))
         cm = confusion_matrix(y_true, y_pred)
-        print(f"Confusion Matrix:\n{cm}")
-        
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=target_names, yticklabels=target_names)
-        plt.title(f'Confusion Matrix for {model_name}')
-        plt.ylabel('Actual Label')
-        plt.xlabel('Predicted Label')
+        plt.figure(figsize=(6, 5))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=le.classes_, yticklabels=le.classes_)
+        plt.title(name + " Confusion Matrix")
+        plt.ylabel('Actual')
+        plt.xlabel('Predicted')
         plt.show()
 
-    target_names = label_encoder.classes_
-    evaluate_multi_class_model(y_test_encoded, rf_pred, "Random Forest Classifier", target_names)
-    evaluate_multi_class_model(y_test_encoded, svm_pred, "SVM Classifier", target_names)
-    evaluate_multi_class_model(y_test_encoded, lr_pred, "Logistic Regression Classifier", target_names)
-    
-    print("\nModel training and evaluation complete.")
-    print("You can now analyze the multi-class performance in your paper.")
-    
+    print("\n==== Final Reports ====")
+    show_report(y_test_enc, rf.predict(X_test_fused), "Random Forest Classifier")
+    show_report(y_test_enc, svm_pipe.predict(X_test_fused), "SVM Classifier (with PCA)")
+    show_report(y_test_enc, lr.predict(X_test_fused), "Logistic Regression Classifier")
+    show_report(y_test_enc, ensemble_pred, "Classical Ensemble Average")
+    show_report(y_test_enc, cnn_pred, "Fine-tuned VGG16 CNN")
+    show_report(y_test_enc, final_pred, "Final Hybrid Fusion (Ensemble + CNN)")
+
+# ------------------------
+# MAIN execution
+# ------------------------
 if __name__ == "__main__":
-    print("Loading data and extracting features for model training...")
-    
     train_dir = "/kaggle/input/brain-tumor-classification-mri/Training"
     test_dir  = "/kaggle/input/brain-tumor-classification-mri/Testing"
-
-    # Load data separately for training and testing
+    
+    print("Loading data...")
     X_train_raw, y_train_raw = load_multi_class_data(train_dir)
     X_test_raw, y_test_raw = load_multi_class_data(test_dir)
     
     if X_train_raw.size == 0 or X_test_raw.size == 0:
         print("No images loaded. Cannot proceed with model training.")
     else:
-        # Pre-process raw image data
-        X_train_reshaped = X_train_raw.reshape(-1, 128, 128, 1)
-        X_test_reshaped = X_test_raw.reshape(-1, 128, 128, 1)
-
-        # Extract and fuse features for both training and testing sets
-        print("\nExtracting and fusing features for training set...")
-        all_train_fused_features = [fuse_features(extract_handcrafted_features(img.squeeze()), extract_deep_features(img)) for img in X_train_reshaped]
-        X_train_fused = pd.DataFrame(all_train_fused_features)
-        X_train_fused.columns = X_train_fused.columns.astype(str)
-
-        print("Extracting and fusing features for testing set...")
-        all_test_fused_features = [fuse_features(extract_handcrafted_features(img.squeeze()), extract_deep_features(img)) for img in X_test_reshaped]
-        X_test_fused = pd.DataFrame(all_test_fused_features)
-        X_test_fused.columns = X_test_fused.columns.astype(str)
+        print("Applying augmentation...")
+        X_train_aug, y_train_aug = augment_class_images(X_train_raw, y_train_raw, AUGMENT_SIZES)
         
-        print("\nFeatures extracted and fused. Proceeding to model training...")
-        train_and_evaluate_models(X_train_fused, y_train_raw, X_test_fused, y_test_raw)
+        X_train_for_feats = X_train_aug
+        X_test_for_feats  = X_test_raw
+
+        vgg_extractor = build_vgg_extractor()
+        X_train_fused, X_test_fused = extract_and_fuse_features(vgg_extractor, X_train_for_feats, X_test_for_feats)
+        
+        X_train_cnn = np.repeat(np.expand_dims(X_train_for_feats, axis=-1), 3, axis=-1)
+        X_test_cnn  = np.repeat(np.expand_dims(X_test_for_feats, axis=-1), 3, axis=-1)
+        X_train_cnn = preprocess_input(X_train_cnn)
+        X_test_cnn  = preprocess_input(X_test_cnn)
+
+        train_and_evaluate(X_train_fused, y_train_aug, X_test_fused, y_test_raw, X_train_cnn, X_test_cnn)
